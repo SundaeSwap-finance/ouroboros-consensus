@@ -762,13 +762,15 @@ partitionMempool leiosDbReader leiosVoteState leiosTracer pmCtrace pmCallCtx cfg
               -- way to split the pool.
               let (rbTxs', rbTxsSize', ebTxs', _ebTxsSize) = snapshotPartition snap rbCap ebCap
                in pure (rbTxs', ebTxs', rbTxsSize', snap)
-            Just (stepsCap, memCap) ->
-              --  This era may allow for heavy transaction that should not be
-              -- included in an RB block so we need to filter them out.
-              -- We stop including transactions in an RB pool as soon as we
-              -- encounter such heavy transaction so that we don't mess with
-              -- the order of transactions in the mempool. That's good enough
-              -- at this step but questionable for production.
+            Just (stepsCap, memCap) -> do
+              --  This era may allow for heavy transactions that should not
+              -- be included in an RB block, so we filter them out. Unlike a
+              -- plain prefix split, we don't stop RB packing at the first
+              -- such heavy tx: we skip over it and keep considering later,
+              -- lighter transactions for the RB. Otherwise a single heavy
+              -- tx sitting in the mempool would wedge every future RB
+              -- behind it, since RB production alone never removes it from
+              -- the mempool (see #1077 task notes).
               --
               -- Only ExUnits (steps, memory) is checked here -- not the tx's
               -- full measure -- since that is the only dimension #1077 cares
@@ -776,22 +778,61 @@ partitionMempool leiosDbReader leiosVoteState leiosTracer pmCtrace pmCallCtx cfg
               let rbEligible (_, _, m) =
                     txMeasureMetricExUnitsSteps m <= stepsCap
                       && txMeasureMetricExUnitsMemory m <= memCap
-                  rbMeasure t@(_, _, m)
-                    | rbEligible t = m
-                    | otherwise = Data.Measure.plus rbCap m
-                  (rbTxTuples, ebOnlyTuples) = Data.Measure.splitAt rbMeasure rbCap (snapshotTxs snap)
+
+                  txs = snapshotTxs snap
+
+                  -- Greedily fill the RB in mempool order: every rbEligible
+                  -- tx that still fits under 'rbCap' is kept; anything else
+                  -- (not rbEligible, or rbEligible but no longer fits) is
+                  -- skipped without stopping the scan.
+                  accumRb (tot, acc) t@(_, _, m)
+                    | rbEligible t, tot' <- Data.Measure.plus tot m, tot' Data.Measure.<= rbCap =
+                        (tot', t : acc)
+                    | otherwise = (tot, acc)
+
+                  (rbTxsSizeMeasure, rbTxTuplesRev) =
+                    Foldable.foldl' accumRb (Data.Measure.zero, []) txs
+                  rbTxTuples = reverse rbTxTuplesRev
                   rbTxs' = [tx | (tx, _, _) <- rbTxTuples]
                   rbTxsSize' =
-                    MempoolMeasure
-                      (Foldable.foldl' Data.Measure.plus Data.Measure.zero [m | (_, _, m) <- rbTxTuples])
-                      Data.Measure.zero
-                      Data.Measure.zero
+                    MempoolMeasure rbTxsSizeMeasure Data.Measure.zero Data.Measure.zero
+
+                  -- Everything strictly after the last tx we put in the RB,
+                  -- in mempool order, is a candidate for the EB -- eligible
+                  -- or not, since the EB has no per-tx exclusion.
+                  lastRbTicket = case rbTxTuples of
+                    [] -> Nothing
+                    _ -> let (_, ticketNo, _) = last rbTxTuples in Just ticketNo
+                  isAfterLastRbTx (_, ticketNo, _) = maybe True (ticketNo >) lastRbTicket
+
                   ebTxs' =
                     [ tx
                     | (tx, _, _) <-
-                        Data.Measure.take (\(_, _, m) -> txEbMeasure (Proxy @blk) m) ebCap ebOnlyTuples
+                        Data.Measure.take (\(_, _, m) -> txEbMeasure (Proxy @blk) m) ebCap (filter isAfterLastRbTx txs)
                     ]
-               in pure (rbTxs', ebTxs', rbTxsSize', snap)
+
+                  -- Non-rbEligible txs strictly *before* the last RB tx were
+                  -- skipped for this RB, and would be skipped again on every
+                  -- future attempt as long as they sit there, wedging RB
+                  -- production behind them. Evict them from the mempool
+                  -- instead (logged below) rather than leaving them in
+                  -- place.
+                  droppedTxs =
+                    [ tx
+                    | t@(tx, _, _) <- txs
+                    , not (rbEligible t)
+                    , not (isAfterLastRbTx t)
+                    ]
+
+              whenJust (NE.nonEmpty (map (txId . txForgetValidated) droppedTxs)) $ \ids -> do
+                traceWith leiosTracer $
+                  MkTraceLeiosKernel $
+                    "partitionMempool: evicting "
+                      <> show (NE.length ids)
+                      <> " non-rbEligible tx(s) blocking RB packing"
+                removeTxsEvenIfValid mempool ids
+
+              pure (rbTxs', ebTxs', rbTxsSize', snap)
       Just (_cert, announcedPoint) -> do
         -- We have a Leios certificate: only take transactions for a new EB, as the RB will
         -- carry the certificate and must not carry additional txs.
