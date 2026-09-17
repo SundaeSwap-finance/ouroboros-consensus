@@ -65,7 +65,7 @@ import Cardano.Ledger.Alonzo.Core
   )
 import qualified Cardano.Ledger.Alonzo.Rules as AlonzoEra
 import Cardano.Ledger.Alonzo.Scripts
-  ( ExUnits
+  ( ExUnits (ExUnits, exUnitsMem, exUnitsSteps)
   , ExUnits' (..)
   , OrdExUnits (..)
   , pointWiseExUnits
@@ -110,7 +110,7 @@ import Data.ByteString.Short (ShortByteString)
 import Data.DerivingVia (InstantiatedAt (..))
 import Data.Foldable (toList)
 import Data.Measure (Measure)
-import Data.Typeable (Typeable)
+import Data.Typeable (Typeable, eqT)
 import qualified Data.Validation as V
 import Data.Word (Word32)
 import GHC.Generics (Generic)
@@ -136,6 +136,7 @@ import Ouroboros.Consensus.Util.Condense
 import Ouroboros.Network.Block (unwrapCBORinCBOR, wrapCBORinCBOR)
 import Ouroboros.Network.SizeInBytes
 import Ouroboros.Network.Tx (HasRawTxId (..))
+import Ouroboros.Network.AnchoredFragment (anchorBlockNo)
 
 data instance GenTx (ShelleyBlock proto era) = ShelleyTx !SL.TxId !(Tx TopTx era)
   deriving stock Generic
@@ -298,6 +299,25 @@ instance Show (GenTxId (ShelleyBlock proto era)) where
   Applying transactions
 -------------------------------------------------------------------------------}
 
+-- Temporary prototype for issue:
+-- https://github.com/input-output-hk/ouroboros-leios/issues/1077
+--
+-- In the Dijkstra era, We tolerate transactions with execution units bigger
+-- than ppMaxTxExUnitsL as long as it's lower than the execution unit for an
+-- EB Block.
+--
+-- Dispatches on the concrete era via 'eqT' rather than a new typeclass
+-- constraint, deliberately: reduce code change for that prototyping step.
+overrideMempoolLedgerPp ::
+  forall era.
+  ShelleyBasedEra era =>
+  SL.NewEpochState era -> SL.MempoolEnv era -> SL.MempoolEnv era
+overrideMempoolLedgerPp innerSt env =
+  case eqT @era @DijkstraEra of
+    Just Refl ->
+      set (ShelleyEra.ledgerPpL . L.ppMaxTxExUnitsL) (getPParams innerSt ^. ppMaxBlockExUnitsL) env
+    Nothing -> env
+
 applyShelleyTx ::
   forall era proto.
   ShelleyBasedEra era =>
@@ -321,7 +341,7 @@ applyShelleyTx cfg wti slot (ShelleyTx _ tx) st0 = do
   (mempoolState', vtx) <-
     applyShelleyBasedTx
       (shelleyLedgerGlobals cfg)
-      (SL.mkMempoolEnv innerSt slot)
+      (overrideMempoolLedgerPp innerSt (SL.mkMempoolEnv innerSt slot))
       (SL.mkMempoolState innerSt)
       wti
       tx
@@ -350,7 +370,7 @@ reapplyShelleyTx cfg slot vgtx st0 = do
     liftEither $
       SL.reapplyTx
         (shelleyLedgerGlobals cfg)
-        (SL.mkMempoolEnv innerSt slot)
+        (overrideMempoolLedgerPp innerSt (SL.mkMempoolEnv innerSt slot))
         (SL.mkMempoolState innerSt)
         vtx
 
@@ -612,7 +632,18 @@ txMeasureAlonzo st tx@(ShelleyTx _txid tx') =
   txsz = totExUnits tx'
 
   pparams = getPParams $ tickedShelleyLedgerState st
-  limit = pparams ^. L.ppMaxTxExUnitsL
+  -- Temporary prototype for issue:
+  -- https://github.com/input-output-hk/ouroboros-leios/issues/1077
+  --
+  -- In the Dijkstra era, We tolerate transactions with execution units bigger
+  -- than ppMaxTxExUnitsL as long as it's lower than the execution unit for an
+  -- EB Block.
+  --
+  -- Dispatches on the concrete era via 'eqT' rather than a new typeclass
+  -- constraint, deliberately: reduce code change for that prototyping step.
+  limit = case eqT @era @DijkstraEra of
+    Just Refl -> pparams ^. ppMaxBlockExUnitsL
+    Nothing -> pparams ^. L.ppMaxTxExUnitsL
 
   exunits =
     validateMaybe (exUnitsTooBigUTxO txsz limit) $ do
@@ -915,4 +946,22 @@ instance
   txMeasure _cfg st tx = runValidation $ txMeasureDijkstra st tx
   blockCapacityTxMeasure _cfg = blockCapacityDijkstraMeasure
   ebCapacityTxMeasure _cfg = Just . leiosEndorserBlockMeasure
+  rbEligibleTxMeasure _cfg st = Just (exUnitsSteps, exUnitsMem)
+   where
+    ExUnits{exUnitsMem, exUnitsSteps} = rbEligibleDijkstraExUnits st
   txWireSize (ShelleyTx _ tx) = wrapCBORinCBOROverhead (tx ^. wireSizeTxF)
+
+-- Temporary prototype for issue:
+-- https://github.com/input-output-hk/ouroboros-leios/issues/1077
+--
+-- In the Dijkstra era, We tolerate transactions with execution units bigger
+-- than ppMaxTxExUnitsL as long as it's lower than the execution unit for an
+-- EB Block. So we need a criteria to filter this transactions out of any
+-- RB Block.
+rbEligibleDijkstraExUnits ::
+  forall proto era mk.
+  (ShelleyCompatible proto era, L.AlonzoEraPParams era) =>
+  TickedLedgerState (ShelleyBlock proto era) mk ->
+  ExUnits
+rbEligibleDijkstraExUnits st =
+  getPParams (tickedShelleyLedgerState st) ^. L.ppMaxTxExUnitsL

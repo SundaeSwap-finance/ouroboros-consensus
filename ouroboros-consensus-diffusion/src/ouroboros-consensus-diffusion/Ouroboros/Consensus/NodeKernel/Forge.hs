@@ -21,6 +21,7 @@ import Control.Monad.Except
 import Control.Tracer
 import Data.Aeson (KeyValue ((.=)))
 import qualified Data.Aeson as Aeson
+import qualified Data.Foldable as Foldable
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Measure
@@ -56,7 +57,7 @@ import Ouroboros.Consensus.Ledger.Tables.Utils
   , prependDiffs
   )
 import Ouroboros.Consensus.Mempool
-import Ouroboros.Consensus.Mempool.API (TxMeasureWithDiffTime)
+import Ouroboros.Consensus.Mempool.API (TxMeasureWithDiffTime (MkTxMeasureWithDiffTime))
 import Ouroboros.Consensus.Node.Run
 import Ouroboros.Consensus.Node.Tracers
 import Ouroboros.Consensus.Protocol.Abstract
@@ -79,8 +80,9 @@ import Ouroboros.Network.AnchoredFragment
   , AnchoredSeq (..)
   )
 import qualified Ouroboros.Network.AnchoredFragment as AF
-import Ouroboros.Network.Point (WithOrigin (..))
+import Ouroboros.Network.Point (WithOrigin (..), at)
 import Ouroboros.Network.Protocol.LocalStateQuery.Type (Target (..))
+import Network.Mux.Types (bearerAsChannel)
 
 -- | Run one leadership check and, if we are leader, forge and adopt a block.
 --
@@ -746,13 +748,52 @@ partitionMempool leiosConn leiosVoteState leiosTracer pmCtrace pmCallCtx cfg mem
         snap <-
           pmTrace'Via (const ()) "mempool-get-snapshot-for" currentSlot $
             getSnapshotFor mempool currentSlot tickedLedgerState readTables
+        pmTrace'Via (const ()) "take-rb-eb-txs" currentSlot $
+          -- Temporary prototype for issue:
+          -- https://github.com/input-output-hk/ouroboros-leios/issues/1077
+          --
+          -- In the Dijkstra era, We tolerate transactions with execution units bigger
+          -- than ppMaxTxExUnitsL as long as it's lower than the execution unit for an
+          -- EB Block. So we need a criteria to filter this transactions out of any
+          -- RB Block.
+          case rbEligibleTxMeasure (configLedger cfg) tickedLedgerState of
+            Nothing ->
+            -- No per-tx RB/EB exclusion for this era so stick with the former
+            -- way to split the pool.
+              let (rbTxs', rbTxsSize') = snapshotTake snap rbCap
+                  ebTxs' =
+                    let (allTxs, _) = snapshotTake snap (Data.Measure.plus rbCap ebCap)
+                     in drop (length rbTxs') allTxs
+               in pure (rbTxs', ebTxs', rbTxsSize', snap)
+            Just (stepsCap, memCap) ->
+              --  This era may allow for heavy transaction that should not be
+              -- included in an RB block so we need to filter them out.
+              -- We stop including transactions in an RB pool as soon as we
+              -- encounter such heavy transaction so that we don't mess with
+              -- the order of transactions in the mempool. That's good enough
+              -- at this step but questionable for production.
+              --
+              -- Only ExUnits (steps, memory) is checked here -- not the tx's
+              -- full measure -- since that is the only dimension #1077 cares
+              -- about.
+              let rbEligible (_, _, m) =
+                    txMeasureMetricExUnitsSteps m <= stepsCap
+                      && txMeasureMetricExUnitsMemory m <= memCap
+                  rbMeasure t@(_, _, m)
+                    | rbEligible t = m
+                    | otherwise = Data.Measure.plus rbCap m
 
-        pmTrace'Via (const ()) "take-rb-eb-txs" currentSlot $ do
-          let (rbTxs', rbTxsSize') = snapshotTake snap rbCap
-              ebTxs' =
-                let (allTxs, _) = snapshotTake snap (Data.Measure.plus rbCap ebCap)
-                 in drop (length rbTxs') allTxs
-          pure (rbTxs', ebTxs', rbTxsSize', snap)
+                  (rbTxTuples, ebOnlyTuples) = Data.Measure.splitAt rbMeasure rbCap (snapshotTxs snap)
+                  rbTxs' = [tx | (tx, _, _) <- rbTxTuples]
+                  rbTxsSize' =
+                    MkTxMeasureWithDiffTime
+                      (Foldable.foldl' Data.Measure.plus Data.Measure.zero [m | (_, _, m) <- rbTxTuples])
+                      Data.Measure.zero
+                  ebTxs' =
+                    [ tx
+                    | (tx, _, _) <- Data.Measure.take (\(_, _, m) -> m) ebCap ebOnlyTuples
+                    ]
+               in pure (rbTxs', ebTxs', rbTxsSize', snap)
       Just (_cert, announcedPoint) -> do
         -- We have a Leios certificate: only take transactions for a new EB, as the RB will
         -- carry the certificate and must not carry additional txs.
