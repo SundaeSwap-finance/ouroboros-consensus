@@ -45,6 +45,7 @@ import qualified Data.SOP.Telescope as Tele
 import Data.Typeable (Typeable)
 import GHC.Generics (Generic)
 import NoThunks.Class (NoThunks)
+import Numeric.Natural (Natural)
 import Ouroboros.Consensus.Block
 import Ouroboros.Consensus.HardFork.Combinator.Abstract
 import Ouroboros.Consensus.HardFork.Combinator.AcrossEras
@@ -465,6 +466,35 @@ instance CanHardFork xs => TxLimits (HardForkBlock xs) where
             ebClosureCapacityTxMeasure
               (completeLedgerConfig' ei pcfg)
               (getFlipTickedLedgerState st')
+
+  -- Temporary prototype for issue:
+  -- https://github.com/input-output-hk/ouroboros-leios/issues/1077
+  --
+  -- Dispatch to the appropriate era's rbEligibleTxMeasure function.
+  rbEligibleTxMeasure
+    HardForkLedgerConfig{..}
+    (TickedHardForkLedgerState transition hardForkState) =
+      hcollapse $
+        hcizipWith proxySingle aux pcfgs hardForkState
+     where
+      pcfgs = getPerEraLedgerConfig hardForkLedgerConfigPerEra
+      ei =
+        State.epochInfoPrecomputedTransitionInfo
+          hardForkLedgerConfigShape
+          transition
+          hardForkState
+
+      aux ::
+        SingleEraBlock blk =>
+        Index xs blk ->
+        WrapPartialLedgerConfig blk ->
+        FlipTickedLedgerState mk blk ->
+        K (Maybe (Natural, Natural)) blk
+      aux _idx pcfg st' =
+        K $
+          rbEligibleTxMeasure
+            (completeLedgerConfig' ei pcfg)
+            (getFlipTickedLedgerState st')
 
 -- | A private type used only to clarify the parameterization of 'applyHelper'
 data ApplyHelperMode :: (Type -> Type) -> Type where
