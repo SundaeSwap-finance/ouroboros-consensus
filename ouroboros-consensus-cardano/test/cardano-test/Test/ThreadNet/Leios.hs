@@ -394,10 +394,20 @@ prop_leios seed =
   -- an RB can finalise the previous EB (via a cert) while announcing the
   -- next one. With continuous tx flow, a certifying block rebases the
   -- mempool onto the post-certified-EB ledger state and announces a fresh EB
-  -- from the survivors. Unless the run produced no certifying blocks at all,
-  -- at least one should exercise the combined path.
+  -- from the survivors.
+  --
+  -- But "survivors" can legitimately be empty: revalidating the mempool
+  -- against the post-closure state evicts exactly the transactions the
+  -- certified EB itself already carried (they're now applied, so they no
+  -- longer apply cleanly), and nothing guarantees a fresh transaction has
+  -- reached this node's mempool in the interim. With only one certifying
+  -- block in the whole run, that single opportunity hinging on mempool
+  -- timing is not evidence of a bug -- same carve-out as
+  -- 'certificationGapIsCorrect' below.
   propCertifyAndAnnounce =
-    (not (null announcedAndCertifiedSlots))
+    ( not (null announcedAndCertifiedSlots)
+        .||. length certificateBlocks <= 1
+    )
       & counterexample "no block both certified and announced"
       & counterexample ("certifying block slots: " <> show certificateBlocks)
       & counterexample ("announced-and-certified slots: " <> show announcedAndCertifiedSlots)
