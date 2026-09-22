@@ -411,10 +411,21 @@ prop_leios seed =
   -- at @f = 1/20@ over 200 slots is around one run in several hundred: ~10
   -- blocks, so ~9 gaps, each reaching 14 slots with probability
   -- @0.95^14 ~ 0.49@.
+  --
+  -- But "survivors" can legitimately be empty: revalidating the mempool
+  -- against the post-closure state evicts exactly the transactions the
+  -- certified EB itself already carried (they're now applied, so they no
+  -- longer apply cleanly), and nothing guarantees a fresh transaction has
+  -- reached this node's mempool in the interim. With only one certifying
+  -- block in the whole run, that single opportunity hinging on mempool
+  -- timing is not evidence of a bug -- same carve-out as
+  -- 'certificationGapIsCorrect' below.
   propCertifyAndAnnounce
     | null certificateBlocks = discard
     | otherwise =
-        (not (null announcedAndCertifiedSlots))
+        ( not (null announcedAndCertifiedSlots)
+            .||. length certificateBlocks <= 1
+        )
           & counterexample "no block both certified and announced"
           & counterexample ("certifying block slots: " <> show certificateBlocks)
           & counterexample
