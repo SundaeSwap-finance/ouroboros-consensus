@@ -15,7 +15,7 @@ module Test.ThreadNet.Leios (tests) where
 
 import qualified Cardano.Chain.Update as Byron
 import Cardano.Ledger.Alonzo.Genesis (AlonzoGenesis (..))
-import Cardano.Ledger.Alonzo.Scripts (AsIx (..), ExUnits (..), Prices (..), pattern SpendingPurpose)
+import Cardano.Ledger.Alonzo.Scripts (AsIx (..), ExUnits (..), OrdExUnits (..), Prices (..), pattern SpendingPurpose)
 import Cardano.Ledger.Alonzo.Tx (hashScriptIntegrity, mkScriptIntegrity)
 import Cardano.Ledger.Alonzo.TxWits (Redeemers (..), TxDats (..))
 import Cardano.Ledger.Api
@@ -64,6 +64,7 @@ import Cardano.Ledger.Dijkstra.PParams
   , ppLeiosAnnouncementPeriodLengthL
   , ppLeiosDiffusionPeriodLengthL
   , ppLeiosVotePeriodLengthL
+  , ppMaxEndorserBlockExUnitsL
   )
 import Cardano.Ledger.Keys (KeyRole (Payment))
 import Cardano.Ledger.Plutus.Data (Data (..), hashData)
@@ -1257,9 +1258,11 @@ data PlutusRoundKind
   = -- | Comfortably under the old per-tx cap ('ppMaxTxExUnitsL'): a plain,
     -- always-accepted Plutus spend.
     Acceptable
-  | -- | Above the old per-tx cap but under the EB's aggregate cap
-    -- ('ppMaxBlockExUnitsL'): the #1077 scenario -- 'rbEligible' (Forge.hs)
-    -- must exclude it from the RB and route it via the EB instead.
+  | -- | Above the RB's aggregate cap ('ppMaxBlockExUnitsL', hence also above
+    -- the old per-tx cap) but under the EB's aggregate cap
+    -- ('ppMaxEndorserBlockExUnitsL'): the #1077 scenario -- the mempool must
+    -- admit it, and 'rbEligible' (Forge.hs) must exclude it from the RB and
+    -- route it via the EB instead.
     Oversized
 
 -- | Build a Plutus round from the given 'CoreNode's funds: bootstrap once
@@ -1315,13 +1318,16 @@ plutusRoundTxs roundKind cn pparams utxo
     Acceptable -> ExUnits (halve (exUnitsMem perTxCap)) (halve (exUnitsSteps perTxCap))
     Oversized ->
       ExUnits
-        (midpoint (exUnitsMem perTxCap) (exUnitsMem ebCap))
-        (midpoint (exUnitsSteps perTxCap) (exUnitsSteps ebCap))
+        (justAbove (exUnitsMem rbCap) (exUnitsMem ebCap))
+        (justAbove (exUnitsSteps rbCap) (exUnitsSteps ebCap))
    where
     perTxCap = pparams ^. ppMaxTxExUnitsL
-    ebCap = pparams ^. ppMaxBlockExUnitsL
+    rbCap = pparams ^. ppMaxBlockExUnitsL
+    ebCap = unOrdExUnits $ pparams ^. ppMaxEndorserBlockExUnitsL
     halve x = x `div` 2
-    midpoint lo hi = lo + (hi - lo) `div` 2
+    -- Strictly above @lo@, but small enough w.r.t. @hi@ that several such
+    -- txs still fit in one EB.
+    justAbove lo hi = lo + (hi - lo) `div` 16
 
   scriptAddr network = Addr network (ScriptHashObj scriptHash) StakeRefNull
 
