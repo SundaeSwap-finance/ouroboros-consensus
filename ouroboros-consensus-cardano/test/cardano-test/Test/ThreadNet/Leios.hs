@@ -14,30 +14,49 @@
 module Test.ThreadNet.Leios (tests) where
 
 import qualified Cardano.Chain.Update as Byron
+import Cardano.Ledger.Alonzo.Genesis (AlonzoGenesis (..))
+import Cardano.Ledger.Alonzo.Scripts (AsIx (..), ExUnits (..), OrdExUnits (..), Prices (..), pattern SpendingPurpose)
+import Cardano.Ledger.Alonzo.Tx (hashScriptIntegrity, mkScriptIntegrity)
+import Cardano.Ledger.Alonzo.TxWits (Redeemers (..), TxDats (..))
 import Cardano.Ledger.Api
   ( Addr (..)
+  , AllegraEraTxBody
   , DijkstraEra
   , EraTx
+  , IsPhase2Valid (..)
   , PParams
   , Tx
   , TxOut
   , addrTxOutL
   , bodyTxL
+  , collateralInputsTxBodyL
+  , dataHashTxOutL
+  , datsTxWitsL
   , emptyPParams
   , eraProtVerLow
   , inputsTxBodyL
+  , isPhase2ValidTxL
   , mkBasicTx
   , mkBasicTxBody
   , mkBasicTxOut
+  , mkBasicTxWits
   , outputsTxBodyL
+  , ppMaxBlockExUnitsL
+  , ppMaxTxExUnitsL
+  , rdmrsTxWitsL
+  , scriptIntegrityHashTxBodyL
+  , scriptTxWitsL
   , txIdTx
   , valueTxOutL
+  , witsTxL
   )
 import Cardano.Ledger.Api.Transition (mkLatestTransitionConfig)
 import Cardano.Ledger.Api.Tx.In (TxIn (..))
 import Cardano.Ledger.BaseTypes (ProtVer (..), StrictMaybe (..), TxIx (..), knownNonZeroBounded)
 import qualified Cardano.Ledger.Block as SL
-import Cardano.Ledger.Core (TopTx, sizeTxF, txSeqBlockBodyL)
+import Cardano.Ledger.Coin (Coin (..))
+import Cardano.Ledger.Core (TopTx, hashScript, sizeTxF, txSeqBlockBodyL)
+import Cardano.Ledger.Credential (Credential (..), StakeReference (..))
 import Cardano.Ledger.Dijkstra.BlockBody (leiosCertBlockBodyL)
 import Cardano.Ledger.Dijkstra.Genesis (DijkstraGenesis (..))
 import Cardano.Ledger.Dijkstra.PParams
@@ -45,7 +64,11 @@ import Cardano.Ledger.Dijkstra.PParams
   , ppLeiosAnnouncementPeriodLengthL
   , ppLeiosDiffusionPeriodLengthL
   , ppLeiosVotePeriodLengthL
+  , ppMaxEndorserBlockExUnitsL
   )
+import Cardano.Ledger.Keys (KeyRole (Payment))
+import Cardano.Ledger.Plutus.Data (Data (..), hashData)
+import Cardano.Ledger.Plutus.Language (Language (..))
 import qualified Cardano.Ledger.Shelley.LedgerState as SL
   ( esLState
   , lsCertState
@@ -53,6 +76,7 @@ import qualified Cardano.Ledger.Shelley.LedgerState as SL
   , nesEs
   , utxosInstantStake
   )
+import Cardano.Ledger.Val (coin, inject, (<->))
 import Cardano.Protocol.Crypto (StandardCrypto)
 import Cardano.Protocol.TPraos.OCert (KESPeriod (..))
 import Cardano.Slotting.Time (SlotLength, slotLengthFromSec)
@@ -72,6 +96,8 @@ import Data.Maybe (isNothing, mapMaybe)
 import Data.Proxy (Proxy (..))
 import Data.Sequence.Strict ((|>))
 import qualified Data.Set as Set
+import Data.Type.Equality ((:~:) (Refl))
+import Data.Typeable (eqT)
 import Data.Word (Word64)
 import LeiosDemoDb
   ( LeiosDbReader
@@ -142,13 +168,15 @@ import System.FS.API (SomeHasFS (..))
 import qualified System.FS.Sim.MockFS as MockFS
 import qualified System.FS.Sim.STM as Sim
 import System.IO.Unsafe (unsafePerformIO)
+import Test.Cardano.Ledger.Alonzo.Arbitrary (alwaysSucceeds)
 import qualified Test.Cardano.Ledger.Alonzo.Examples as Alonzo
 import qualified Test.Cardano.Ledger.Conway.Examples as Conway
 import qualified Test.Cardano.Ledger.Dijkstra.Examples as Dijkstra
 import qualified Test.Cardano.Ledger.Shelley.Examples as Shelley (leTranslationContext)
 import Test.Consensus.Cardano.ProtocolInfo (Era (Dijkstra), hardForkInto)
 import Test.QuickCheck
-  ( Property
+  ( Gen
+  , Property
   , Testable
   , choose
   , conjoin
@@ -367,10 +395,20 @@ prop_leios seed =
   -- an RB can finalise the previous EB (via a cert) while announcing the
   -- next one. With continuous tx flow, a certifying block rebases the
   -- mempool onto the post-certified-EB ledger state and announces a fresh EB
-  -- from the survivors. Unless the run produced no certifying blocks at all,
-  -- at least one should exercise the combined path.
+  -- from the survivors.
+  --
+  -- But "survivors" can legitimately be empty: revalidating the mempool
+  -- against the post-closure state evicts exactly the transactions the
+  -- certified EB itself already carried (they're now applied, so they no
+  -- longer apply cleanly), and nothing guarantees a fresh transaction has
+  -- reached this node's mempool in the interim. With only one certifying
+  -- block in the whole run, that single opportunity hinging on mempool
+  -- timing is not evidence of a bug -- same carve-out as
+  -- 'certificationGapIsCorrect' below.
   propCertifyAndAnnounce =
-    (not (null announcedAndCertifiedSlots))
+    ( not (null announcedAndCertifiedSlots)
+        .||. length certificateBlocks <= 1
+    )
       & counterexample "no block both certified and announced"
       & counterexample ("certifying block slots: " <> show certificateBlocks)
       & counterexample ("announced-and-certified slots: " <> show announcedAndCertifiedSlots)
@@ -1058,6 +1096,10 @@ runThreadNet' initSeed numSlots numCoreNodes joinPlan tweakNodeInit =
           mkLatestTransitionConfig
             shelleyGenesis
             (Shelley.leTranslationContext Alonzo.ledgerExamples)
+                -- setting 0 fee economics on Plutus execution to
+                -- allow any number of plutus transactions to be
+                -- executed by these tests.
+                { agPrices = Prices minBound minBound }
             (Shelley.leTranslationContext Conway.ledgerExamples)
             (Shelley.leTranslationContext Dijkstra.ledgerExamples)
       , cardanoCheckpoints = mempty
@@ -1109,14 +1151,41 @@ runThreadNet' initSeed numSlots numCoreNodes joinPlan tweakNodeInit =
             { ctgeByronGenesisKeys = error "unused"
             , ctgeNetworkMagic = error "unused"
             , ctgeShelleyCoreNodes = coreNodes
-            , ctgeExtraTxGen = \slot cn pparams utxo ->
-                -- NOTE: Stop generating txs 20 slots before end of test run.
-                if unSlotNo slot > unNumSlots numSlots - 20
-                  then pure []
-                  else pure $ constantLoadTxs numCoreNodes (TPS 100) slot cn pparams utxo
+            , ctgeExtraTxGen = extraTxGen
             }
       , version = newestVersion (Proxy @(CardanoBlock StandardCrypto))
       }
+
+  extraTxGen ::
+    forall era.
+    (EraTx era) =>
+    SlotNo ->
+    CoreNode StandardCrypto ->
+    PParams era ->
+    Map TxIn (TxOut era) ->
+    Gen [Tx TopTx era]
+  extraTxGen slot coreNode pparams utxo =
+    case eqT @era @DijkstraEra of
+      Nothing -> error "extraTxGen: this test always runs in DijkstraEra"
+      Just Refl
+        | n < 2 ->
+            error "extraTxGen: needs a dedicated Plutus node plus at least one respend node"
+        -- NOTE: Stop generating txs 20 slots before end of test run.
+        | unSlotNo slot > unNumSlots numSlots - 20 -> pure []
+        | isPlutusNode coreNode -> pure $ plutusLoadTxs slot coreNode pparams utxo
+        | otherwise ->
+            pure $ constantLoadTxs numRespendNodes (TPS 100) slot coreNode pparams utxo
+
+  -- The first core node only posts Plutus txs and the others only respend.
+  -- Each node spends its own funds only, so neither load can spend an input
+  -- the other relies on (e.g. the Plutus collateral) based on a stale ledger
+  -- view (see the FIXME in 'constantLoadTxs').
+  isPlutusNode cn =
+    paymentCredential cn `elem` map paymentCredential (take 1 coreNodes)
+
+  paymentCredential cn = mkCredential (cnDelegateKey cn) :: Credential Payment
+
+  numRespendNodes = NumCoreNodes (n - 1)
 
 -- * Fixtures
 
@@ -1163,6 +1232,156 @@ constantLoadTxs (NumCoreNodes n) (TPS txPerSecond) slot cn pparams utxo
   expectedBlockTime = truncate $ 1 / activeSlotCoeff
 
   txPerSecondPerNode = txPerSecond `div` n
+
+-- | Plutus load of the dedicated Plutus node: one 'plutusRoundTxs' per
+-- submission slot of 'constantLoadTxs', alternating 'Acceptable' and
+-- 'Oversized' rounds.
+plutusLoadTxs ::
+  SlotNo ->
+  CoreNode StandardCrypto ->
+  PParams DijkstraEra ->
+  Map TxIn (TxOut DijkstraEra) ->
+  [Tx TopTx DijkstraEra]
+plutusLoadTxs slot cn pparams utxo
+  | shouldSubmit = plutusRoundTxs roundKind cn pparams utxo
+  | otherwise = []
+ where
+  shouldSubmit = unSlotNo slot `mod` expectedBlockTime == 0
+
+  roundKind
+    | even (unSlotNo slot `div` expectedBlockTime) = Acceptable
+    | otherwise = Oversized
+
+  expectedBlockTime = truncate $ 1 / activeSlotCoeff
+
+data PlutusRoundKind
+  = -- | Comfortably under the old per-tx cap ('ppMaxTxExUnitsL'): a plain,
+    -- always-accepted Plutus spend.
+    Acceptable
+  | -- | Above the RB's aggregate cap ('ppMaxBlockExUnitsL', hence also above
+    -- the old per-tx cap) but under the EB's aggregate cap
+    -- ('ppMaxEndorserBlockExUnitsL'): the #1077 scenario -- the mempool must
+    -- admit it, and 'rbEligible' (Forge.hs) must exclude it from the RB and
+    -- route it via the EB instead.
+    Oversized
+
+-- | Build a Plutus round from the given 'CoreNode's funds: bootstrap once
+-- by locking part of its payment-key UTxO at a trivial always-succeeds
+-- script, then on every later round, relock the contract's existing UTxO
+-- back onto itself.
+plutusRoundTxs ::
+  PlutusRoundKind ->
+  CoreNode StandardCrypto ->
+  PParams DijkstraEra ->
+  Map TxIn (TxOut DijkstraEra) ->
+  [Tx TopTx DijkstraEra]
+plutusRoundTxs roundKind cn pparams utxo
+  | contractIsNotFunded = fundContract
+  | otherwise =
+      let (scriptIn, scriptOut) : _ = Map.toList scriptUtxo
+          (collateralIn, _collateralOut) : _ = myUtxo
+       in [mkRelockTx scriptIn scriptOut collateralIn]
+ where
+  myUtxo = case Map.toList (Map.filter (ownedBy paymentSK) utxo) of
+    [] ->
+      error $
+        "plutusRoundTxs: CoreNode's payment key owns no UTxO (out of "
+          <> show (Map.size utxo)
+          <> " total entries)"
+    xs -> xs
+
+  CoreNode{cnDelegateKey = paymentSK} = cn
+
+  ownedBy sk out = case out ^. addrTxOutL of
+    Addr _ cred _ -> cred == mkCredential sk
+    _ -> False
+
+  contractIsNotFunded = Map.null scriptUtxo
+
+  fundContract =
+    let (fundingIn, fundingOut) : _ = myUtxo
+     in [mkLockTx fundingIn fundingOut]
+
+  scriptUtxo = Map.filter ownedByScript utxo
+
+  ownedByScript out = case out ^. addrTxOutL of
+    Addr _ (ScriptHashObj sh) _ -> sh == scriptHash
+    _ -> False
+
+  script = alwaysSucceeds @'PlutusV1 @DijkstraEra 3
+  scriptHash = hashScript script
+  plutusDatum = Alonzo.exampleDatum :: Data DijkstraEra
+  datumHash = hashData plutusDatum
+  plutusRedeemer = plutusDatum
+
+  plutusExUnits = case roundKind of
+    Acceptable -> ExUnits (halve (exUnitsMem perTxCap)) (halve (exUnitsSteps perTxCap))
+    Oversized ->
+      ExUnits
+        (justAbove (exUnitsMem rbCap) (exUnitsMem ebCap))
+        (justAbove (exUnitsSteps rbCap) (exUnitsSteps ebCap))
+   where
+    perTxCap = pparams ^. ppMaxTxExUnitsL
+    rbCap = pparams ^. ppMaxBlockExUnitsL
+    ebCap = unOrdExUnits $ pparams ^. ppMaxEndorserBlockExUnitsL
+    halve x = x `div` 2
+    -- Strictly above @lo@, but small enough w.r.t. @hi@ that several such
+    -- txs still fit in one EB.
+    justAbove lo hi = lo + (hi - lo) `div` 16
+
+  scriptAddr network = Addr network (ScriptHashObj scriptHash) StakeRefNull
+
+  mkLockTx fundingIn fundingOut =
+    force $
+      mkBasicTx mkBasicTxBody
+        & bodyTxL . inputsTxBodyL .~ Set.singleton fundingIn
+        & bodyTxL . outputsTxBodyL
+          %~ (|> changeOut) . (|> lockedOut)
+        & signTx paymentSK
+   where
+    Addr network _ _ = fundingOut ^. addrTxOutL
+
+    Coin fundingLovelace = coin (fundingOut ^. valueTxOutL)
+    lockAmount = Coin (fundingLovelace `div` 2)
+
+    lockedOut =
+      mkBasicTxOut (scriptAddr network) (inject lockAmount)
+        & dataHashTxOutL .~ SJust datumHash
+
+    changeOut =
+      mkBasicTxOut (fundingOut ^. addrTxOutL) (fundingOut ^. valueTxOutL <-> inject lockAmount)
+
+  -- NOTE: Fees are zero in thread net (see infiniteRespendTxs)
+  mkRelockTx scriptIn scriptOut collateralIn =
+    force $
+      skeleton
+        & bodyTxL . outputsTxBodyL .~ (mempty |> finalOut)
+        & signTx paymentSK
+   where
+    Addr network _ _ = scriptOut ^. addrTxOutL
+
+    skeletonWithPlaceholderOut =
+      mkBasicTx mkBasicTxBody
+        & bodyTxL . inputsTxBodyL .~ Set.singleton scriptIn
+        & bodyTxL . collateralInputsTxBodyL .~ Set.singleton collateralIn
+        & bodyTxL . outputsTxBodyL %~ (|> mkBasicTxOut (scriptAddr network) (scriptOut ^. valueTxOutL))
+        & witsTxL
+          .~ ( mkBasicTxWits
+                 & scriptTxWitsL .~ Map.singleton scriptHash script
+                 & datsTxWitsL .~ TxDats (Map.singleton datumHash plutusDatum)
+                 & rdmrsTxWitsL
+                   .~ Redeemers (Map.singleton (SpendingPurpose (AsIx 0)) (plutusRedeemer, plutusExUnits))
+             )
+        & isPhase2ValidTxL .~ Phase2Valid
+
+    skeleton =
+      skeletonWithPlaceholderOut
+        & bodyTxL . scriptIntegrityHashTxBodyL
+          .~ (hashScriptIntegrity <$> mkScriptIntegrity pparams skeletonWithPlaceholderOut (Set.singleton PlutusV1))
+
+    finalOut =
+      mkBasicTxOut (scriptAddr network) (scriptOut ^. valueTxOutL)
+        & dataHashTxOutL .~ SJust datumHash
 
 -- | Generates an infinite list of transactions that respend the first output
 -- owned by given 'CoreNode' (delegate key interpreted as payment key).

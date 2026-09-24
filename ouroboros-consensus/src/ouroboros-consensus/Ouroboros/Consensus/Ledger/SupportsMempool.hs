@@ -55,6 +55,7 @@ import Ouroboros.Consensus.Block.Abstract
 import Ouroboros.Consensus.Ledger.Abstract
 import Ouroboros.Consensus.Ledger.Tables.Utils
 import Ouroboros.Network.SizeInBytes as Network
+import Ouroboros.Network.AnchoredFragment (anchorBlockNo)
 
 -- | Generalized transaction
 --
@@ -430,6 +431,21 @@ class
     TickedLedgerState blk mk ->
     TxMeasure blk
   ebClosureCapacityTxMeasure _ _ = zero
+
+  -- Temporary prototype for issue:
+  -- https://github.com/input-output-hk/ouroboros-leios/issues/1077
+  --
+  -- In the Dijkstra era, We tolerate transactions with execution units bigger
+  -- than ppMaxTxExUnitsL as long as it's lower than the execution unit for an
+  -- EB Block. So we need a criteria to filter this transactions out of any
+  -- RB Block.
+  --
+  -- Returns 'Nothing' for eras other than Dijkstra.
+  rbEligibleTxMeasure ::
+    LedgerConfig blk ->
+    TickedLedgerState blk mk ->
+    Maybe (Natural, Natural) -- (steps, memory)
+  rbEligibleTxMeasure _ _ = Nothing
 
 -- | We intentionally do not declare a 'Num' instance! We prefer @ByteSize32@
 -- to occur explicitly in the code where possible, for
