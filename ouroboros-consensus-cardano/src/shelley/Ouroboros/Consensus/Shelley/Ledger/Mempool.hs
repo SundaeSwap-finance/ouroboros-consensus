@@ -317,7 +317,7 @@ overrideMempoolLedgerPp ::
 overrideMempoolLedgerPp innerSt env =
   case eqT @era @DijkstraEra of
     Just Refl ->
-      set (ShelleyEra.ledgerPpL . L.ppMaxTxExUnitsL) (getPParams innerSt ^. ppMaxBlockExUnitsL) env
+      set (ShelleyEra.ledgerPpL . L.ppMaxTxExUnitsL) (unOrdExUnits $ getPParams innerSt ^. ppMaxEndorserBlockExUnitsL) env
     Nothing -> env
 
 applyShelleyTx ::
@@ -643,7 +643,7 @@ txMeasureAlonzo st tx@(ShelleyTx _txid tx') =
   -- Dispatches on the concrete era via 'eqT' rather than a new typeclass
   -- constraint, deliberately: reduce code change for that prototyping step.
   limit = case eqT @era @DijkstraEra of
-    Just Refl -> pparams ^. ppMaxBlockExUnitsL
+    Just Refl -> unOrdExUnits $ pparams ^. ppMaxEndorserBlockExUnitsL
     Nothing -> pparams ^. L.ppMaxTxExUnitsL
 
   exunits =
