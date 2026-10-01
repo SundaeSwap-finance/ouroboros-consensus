@@ -18,7 +18,7 @@ import Control.Concurrent.Class.MonadSTM.Strict
   , tryReadTChan
   )
 import Control.DeepSeq (force)
-import Control.Exception (bracket)
+import Control.Exception (bracket, try)
 import Control.Monad (forM, forM_, replicateM, void)
 import Control.Monad.Class.MonadTime.SI (diffTime, getMonotonicTime)
 import Control.Tracer (nullTracer)
@@ -41,6 +41,7 @@ import LeiosDemoDb
   , withReader
   , withWriter
   )
+import LeiosDemoException (LeiosDbException)
 import LeiosDemoTypes
   ( BytesSize
   , EbHash (..)
@@ -88,6 +89,10 @@ tests =
              [ testCase "keeps the txs an EB references" $
                  withFreshSQLiteFile test_deleteDanglingTxs
              ]
+         , -- InMemory only: on SQLite a failed ingest write also kills the
+           -- writer (see 'startWriter'), which is linked to the test thread.
+           testCase "InMemory: inserting a body for an unregistered point fails, as on SQLite" $
+             withFreshDb InMemory test_ebBodyWithoutPointFails
          ]
 
 -- | Database creation strategy for different implementations.
@@ -755,6 +760,18 @@ test_multipleSlotsSameHash db = do
     length completionNotifs @?= 2
  where
   setEquals xs ys = Map.fromList [(p, ()) | p <- xs] @?= Map.fromList [(p, ()) | p <- ys]
+
+-- | A body can only be persisted for a point already registered (via
+-- 'writeEbPoint', on the announcement path).
+test_ebBodyWithoutPointFails :: LeiosDbHandle IO -> IO ()
+test_ebBodyWithoutPointFails db = withRW db $ \con -> do
+  result <- tryDb $ rwInsertEbBody con (mkTestPoint (SlotNo 1) 1) (mkTestEb 2)
+  case result of
+    Left _ -> pure ()
+    Right _ -> assertFailure "writeEbBody succeeded for a point that was never registered"
+ where
+  tryDb :: IO a -> IO (Either LeiosDbException a)
+  tryDb = try
 
 -- | Re-registering a point whose hash is already known complete -- the same
 -- (slot, hash), e.g. a duplicate announcement/arrival of the same EB point
