@@ -425,7 +425,7 @@ populateDb opts db =
       pointWritten <- writeEbPoint writer point (encodeLeiosEbSize eb)
       bodyWritten <- writeEbBody writer point eb
       txsWritten <- writeTxs writer txs
-      awaitAll [pointWritten, void bodyWritten, void txsWritten]
+      awaitAll [void pointWritten, void bodyWritten, void txsWritten]
       pure (slot, hashBytes)
 
 -- | Drop the tx -> referencing-EB index from the volatile partition
@@ -532,7 +532,7 @@ runPhases opts db flushEvents latRef sweepBacklog schedule immBefore =
                   bodyWritten <- writeEbBody w point eb
                   txsWritten <- writeTxs w txs
                   -- Awaiting all three times them to durability.
-                  awaitAll [pointWritten, void bodyWritten, void txsWritten]
+                  awaitAll [void pointWritten, void bodyWritten, void txsWritten]
                   pure ()
               )
     _ <- flushEvents -- discard events from handle setup
@@ -565,10 +565,11 @@ runPhases opts db flushEvents latRef sweepBacklog schedule immBefore =
                 -- exercise the copier (floor would promote none)
                 ceiling (promoteFraction * fromIntegral (length due) :: Double)
           -- One batched call, as 'copyToImmutableDB' does it.
-          (_, promoteWall) <- timed $
-            leiosDbPromoteToImmutable
-              db
-              [MkLeiosPoint (SlotNo s) (MkEbHash h) | (s, h) <- take nPromote due]
+          (_, promoteWall) <-
+            timed $
+              leiosDbPromoteToImmutable
+                db
+                [MkLeiosPoint (SlotNo s) (MkEbHash h) | (s, h) <- take nPromote due]
           promotedTotal <- atomicModifyIORef' promotedRef (\c -> (c + nPromote, c + nPromote))
           (_, copyWaitWall) <- timed $ awaitCopier (immBefore + promotedTotal)
           -- 3. GC: mark, then wait for the sweeper to drain
