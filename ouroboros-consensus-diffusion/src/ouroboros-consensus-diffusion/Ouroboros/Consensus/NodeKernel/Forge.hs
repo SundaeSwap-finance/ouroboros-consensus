@@ -21,6 +21,7 @@ import Control.Monad.Except
 import Control.Tracer
 import Data.Aeson (KeyValue ((.=)))
 import qualified Data.Aeson as Aeson
+import qualified Data.Foldable as Foldable
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe (isJust)
 import qualified Data.Measure
@@ -56,7 +57,7 @@ import Ouroboros.Consensus.Ledger.Tables.Utils
   , prependDiffs
   )
 import Ouroboros.Consensus.Mempool
-import Ouroboros.Consensus.Mempool.API (MempoolMeasure)
+import Ouroboros.Consensus.Mempool.API (MempoolMeasure (..))
 import Ouroboros.Consensus.Node.Run
 import Ouroboros.Consensus.Node.Tracers
 import Ouroboros.Consensus.Protocol.Abstract
@@ -79,8 +80,9 @@ import Ouroboros.Network.AnchoredFragment
   , AnchoredSeq (..)
   )
 import qualified Ouroboros.Network.AnchoredFragment as AF
-import Ouroboros.Network.Point (WithOrigin (..))
+import Ouroboros.Network.Point (WithOrigin (..), at)
 import Ouroboros.Network.Protocol.LocalStateQuery.Type (Target (..))
+import Network.Mux.Types (bearerAsChannel)
 
 -- | Run one leadership check and, if we are leader, forge and adopt a block.
 --
@@ -239,7 +241,18 @@ forge forgeEventTracer forgeStateInfoTracer leiosTracer forgeCCtx cfg chainDB me
               , Block.fbLeiosTracer = leiosTracer
               , Block.fbLeiosVoteState = leiosVoteState
               }
-          , ledgerTipPoint (ledgerState unticked)
+          , ForgingOnTopOf
+              { forgingOnTopOfPoint = ledgerTipPoint (ledgerState unticked)
+              , -- 'unticked' is the state at 'bcPrevPoint', ie at the block we
+                -- are extending, so its view is the one at that block's slot.
+                forgingOnTopOfPredecessor =
+                  case pointSlot bcPrevPoint of
+                    Origin -> ChainDB.NoPredecessor
+                    NotOrigin slot ->
+                      ChainDB.Predecessor
+                        slot
+                        (ledgerViewOfTip (configLedger cfg) (ledgerState unticked))
+              }
           , snapshotMempoolSize mempoolSnapshot
           , rbTxsSize
           )
@@ -256,7 +269,7 @@ forge forgeEventTracer forgeStateInfoTracer leiosTracer forgeCCtx cfg chainDB me
   trace $
     TraceForgedBlock
       currentSlot
-      forgingOnTopOf
+      (forgingOnTopOfPoint forgingOnTopOf)
       newBlock
       snapSize
       rbTxsSize
@@ -281,6 +294,7 @@ forge forgeEventTracer forgeStateInfoTracer leiosTracer forgeCCtx cfg chainDB me
       chainDB
       mempool
       currentSlot
+      (forgingOnTopOfPredecessor forgingOnTopOf)
       (Block.fbRbTxs forgeBlockArgs)
       (Block.fbEbTxs forgeBlockArgs)
       newBlock
@@ -316,16 +330,16 @@ decideLeiosCertify ::
   ExtLedgerState blk EmptyMK ->
   m (Maybe (LeiosCert, Leios.EbHash))
 decideLeiosCertify leiosDbReader voteState tracer ledgerCfg currentSlot extState =
-  case (,) <$> protocolStateLeiosAnnouncement @blk (headerStateChainDep hs) <*> mMinGap of
+  case (,) <$> announcedPoint <*> mMinGap of
     Nothing -> pure Nothing
-    Just ((ebPoint, _ebSize), minGap)
+    Just (ebPoint, minGap)
       | unSlotNo currentSlot - unSlotNo (Leios.pointSlotNo ebPoint) <= unSlotNo minGap ->
           pure Nothing
       | otherwise -> do
           -- TODO: Why exactly do we guard against this? Also, shouldn't we
           -- detect it the other way around: if we have a cert, but not
           -- downloaded it ourselves -> warning!
-          mClosure <- lookupEbClosure leiosDbReader (Leios.pointEbHash ebPoint)
+          mClosure <- lookupTrustedEbClosure leiosDbReader (Leios.pointEbHash ebPoint)
           case mClosure of
             Nothing -> do
               traceWith tracer $
@@ -360,6 +374,12 @@ decideLeiosCertify leiosDbReader voteState tracer ledgerCfg currentSlot extState
   -- The gap comes from the era's protocol parameters, so only the era knows it;
   -- 'Nothing' means this era does not do Leios and nothing is certifiable.
   mMinGap = Leios.getMinCertificationGap ledgerCfg (ledgerState extState)
+
+  -- What the parent announced, if anything: the endorser block a certificate
+  -- here would be for.
+  announcedPoint =
+    Leios.announcementLeiosPoint
+      <$> protocolStateLeiosAnnouncement @blk (headerStateChainDep hs)
 
   hs = headerState extState
 
@@ -486,6 +506,13 @@ mkCurrentBlockContext currentSlot c = case c of
           -- block no and same predecessor.
           else BlockContext (blockNo hdr) $ castPoint $ AF.headPoint c'
 
+-- | The block a forge is extending
+data ForgingOnTopOf blk = ForgingOnTopOf
+  { forgingOnTopOfPoint :: !(Point blk)
+  , forgingOnTopOfPredecessor :: !(ChainDB.Predecessor blk)
+  -- ^ What the ChainDB needs to know about it when the forged block is added.
+  }
+
 -- | Add a forged block to the ChainDB, tracing whether it was adopted, and
 -- removing its transactions from the mempool if it turned out to be invalid.
 addBlockToChainDB ::
@@ -494,11 +521,14 @@ addBlockToChainDB ::
   ChainDB m blk ->
   Mempool m blk ->
   SlotNo ->
+  -- | The block we are extending, from the 'BlockContext' this block was
+  -- forged against.
+  ChainDB.Predecessor blk ->
   [Validated (GenTx blk)] ->
   [Validated (GenTx blk)] ->
   blk ->
   WithEarlyExit m ()
-addBlockToChainDB trace chainDB mempool currentSlot rbTxs ebTxs newBlock = do
+addBlockToChainDB trace chainDB mempool currentSlot predecessor rbTxs ebTxs newBlock = do
   let noPunish = InvalidBlockPunishment.noPunishment -- no way to punish yourself
   -- Make sure that if an async exception is thrown while a block is
   -- added to the chain db, we will remove txs from the mempool.
@@ -508,7 +538,7 @@ addBlockToChainDB trace chainDB mempool currentSlot rbTxs ebTxs newBlock = do
   -- 'uninterruptibleMask_' to make sure that async exceptions do not
   -- interrupt it.
   uninterruptibleMask_ $ do
-    result <- lift $ ChainDB.addBlockAsync chainDB noPunish newBlock
+    result <- lift $ ChainDB.addBlockAsync chainDB noPunish predecessor newBlock
     -- Block until we have processed the block
     mbCurTip <- lift $ atomically $ ChainDB.blockProcessed result
 
@@ -746,10 +776,91 @@ partitionMempool leiosDbReader leiosVoteState leiosTracer pmCtrace pmCallCtx cfg
         snap <-
           pmTrace'Via (const ()) "mempool-get-snapshot-for" currentSlot $
             getSnapshotFor mempool currentSlot tickedLedgerState readTables
+        pmTrace'Via (const ()) "take-rb-eb-txs" currentSlot $
+          -- Temporary prototype for issue:
+          -- https://github.com/input-output-hk/ouroboros-leios/issues/1077
+          --
+          -- In the Dijkstra era, We tolerate transactions with execution units bigger
+          -- than ppMaxTxExUnitsL as long as it's lower than the execution unit for an
+          -- EB Block. So we need a criteria to filter this transactions out of any
+          -- RB Block.
+          case rbEligibleTxMeasure (configLedger cfg) tickedLedgerState of
+            Nothing ->
+              -- No per-tx RB/EB exclusion for this era so stick with the former
+              -- way to split the pool.
+              let (rbTxs', rbTxsSize', ebTxs', _ebTxsSize) = snapshotPartition snap rbCap ebCap
+               in pure (rbTxs', ebTxs', rbTxsSize', snap)
+            Just (stepsCap, memCap) -> do
+              --  This era may allow for heavy transactions that should not
+              -- be included in an RB block, so we filter them out. Unlike a
+              -- plain prefix split, we don't stop RB packing at the first
+              -- such heavy tx: we skip over it and keep considering later,
+              -- lighter transactions for the RB. Otherwise a single heavy
+              -- tx sitting in the mempool would wedge every future RB
+              -- behind it, since RB production alone never removes it from
+              -- the mempool (see #1077 task notes).
+              --
+              -- Only ExUnits (steps, memory) is checked here -- not the tx's
+              -- full measure -- since that is the only dimension #1077 cares
+              -- about.
+              let rbEligible (_, _, m) =
+                    txMeasureMetricExUnitsSteps m <= stepsCap
+                      && txMeasureMetricExUnitsMemory m <= memCap
 
-        pmTrace'Via (const ()) "take-rb-eb-txs" currentSlot $ do
-          let (rbTxs', rbTxsSize', ebTxs', _ebTxsSize) = snapshotPartition snap rbCap ebCap
-          pure (rbTxs', ebTxs', rbTxsSize', snap)
+                  txs = snapshotTxs snap
+
+                  -- Greedily fill the RB in mempool order: every rbEligible
+                  -- tx that still fits under 'rbCap' is kept; anything else
+                  -- (not rbEligible, or rbEligible but no longer fits) is
+                  -- skipped without stopping the scan.
+                  accumRb (tot, acc) t@(_, _, m)
+                    | rbEligible t, tot' <- Data.Measure.plus tot m, tot' Data.Measure.<= rbCap =
+                        (tot', t : acc)
+                    | otherwise = (tot, acc)
+
+                  (rbTxsSizeMeasure, rbTxTuplesRev) =
+                    Foldable.foldl' accumRb (Data.Measure.zero, []) txs
+                  rbTxTuples = reverse rbTxTuplesRev
+                  rbTxs' = [tx | (tx, _, _) <- rbTxTuples]
+                  rbTxsSize' =
+                    MempoolMeasure rbTxsSizeMeasure Data.Measure.zero Data.Measure.zero
+
+                  -- Everything strictly after the last tx we put in the RB,
+                  -- in mempool order, is a candidate for the EB -- eligible
+                  -- or not, since the EB has no per-tx exclusion.
+                  lastRbTicket = case rbTxTuples of
+                    [] -> Nothing
+                    _ -> let (_, ticketNo, _) = last rbTxTuples in Just ticketNo
+                  isAfterLastRbTx (_, ticketNo, _) = maybe True (ticketNo >) lastRbTicket
+
+                  ebTxs' =
+                    [ tx
+                    | (tx, _, _) <-
+                        Data.Measure.take (\(_, _, m) -> txEbMeasure (Proxy @blk) m) ebCap (filter isAfterLastRbTx txs)
+                    ]
+
+                  -- Non-rbEligible txs strictly *before* the last RB tx were
+                  -- skipped for this RB, and would be skipped again on every
+                  -- future attempt as long as they sit there, wedging RB
+                  -- production behind them. Evict them from the mempool
+                  -- instead (logged below) rather than leaving them in
+                  -- place.
+                  droppedTxs =
+                    [ tx
+                    | t@(tx, _, _) <- txs
+                    , not (rbEligible t)
+                    , not (isAfterLastRbTx t)
+                    ]
+
+              whenJust (NE.nonEmpty (map (txId . txForgetValidated) droppedTxs)) $ \ids -> do
+                traceWith leiosTracer $
+                  MkTraceLeiosKernel $
+                    "partitionMempool: evicting "
+                      <> show (NE.length ids)
+                      <> " non-rbEligible tx(s) blocking RB packing"
+                removeTxsEvenIfValid mempool ids
+
+              pure (rbTxs', ebTxs', rbTxsSize', snap)
       Just (_cert, announcedPoint) -> do
         -- We have a Leios certificate: only take transactions for a new EB, as the RB will
         -- carry the certificate and must not carry additional txs.
